@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: gcl [options] <namespace/repo> [directory] [-- <git clone args>]
+
+Clones repositories with short expressive prefixes. Examples:
+  gcl evernet/betterfly
+  gcl gl:team/project ~/src/project
+  gcl --protocol https gh:cli -- --depth 1
+
+Options:
+  -p, --protocol {ssh,https}  Choose the transport protocol (default: ssh)
+  -H, --host HOST             Override the target host explicitly
+  -d, --default-provider NAME Default provider when no prefix is supplied
+  -h, --help                  Show this message
+
+Providers:
+  gh/github    -> ${HERMES_GCL_GITHUB_HOST:-github.com}
+  gl/gitlab    -> ${HERMES_GCL_GITLAB_HOST:-gitlab.com}
+  bb/bitbucket -> ${HERMES_GCL_BITBUCKET_HOST:-bitbucket.org}
+
+Environment variables:
+  HERMES_GCL_PROTOCOL           Default protocol (ssh|https)
+  HERMES_GCL_DEFAULT_PROVIDER   Default provider alias (github|gitlab|bitbucket)
+  HERMES_GCL_GITHUB_HOST        Override GitHub host
+  HERMES_GCL_GITLAB_HOST        Override GitLab host
+  HERMES_GCL_BITBUCKET_HOST     Override Bitbucket host
+  HERMES_GCL_EXTRA_ARGS         Extra arguments appended to git clone
+USAGE
+}
+
+proto="${HERMES_GCL_PROTOCOL:-ssh}"
+default_provider="${HERMES_GCL_DEFAULT_PROVIDER:-github}"
+explicit_host=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--protocol)
+      [[ $# -ge 2 ]] || { echo "--protocol requires a value" >&2; exit 1; }
+      proto="$2"
+      shift 2
+      ;;
+    -H|--host)
+      [[ $# -ge 2 ]] || { echo "--host requires a value" >&2; exit 1; }
+      explicit_host="$2"
+      shift 2
+      ;;
+    -d|--default-provider)
+      [[ $# -ge 2 ]] || { echo "--default-provider requires a value" >&2; exit 1; }
+      default_provider="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+spec="$1"
+shift || true
+
+destination=""
+if [[ $# -gt 0 && "$1" != "--" ]]; then
+  destination="$1"
+  shift
+fi
+
+clone_args=()
+if [[ $# -gt 0 ]]; then
+  if [[ "$1" == "--" ]]; then
+    shift
+    # shellcheck disable=SC2206
+    clone_args=($@)
+  else
+    echo "Unexpected argument: $1" >&2
+    usage >&2
+    exit 1
+  fi
+fi
+
+if [[ "$proto" != "ssh" && "$proto" != "https" ]]; then
+  echo "Unsupported protocol: $proto" >&2
+  exit 1
+fi
+
+extra_env_args=()
+if [[ -n "${HERMES_GCL_EXTRA_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  extra_env_args=(${HERMES_GCL_EXTRA_ARGS})
+fi
+
+build_remote() {
+  local provider="$1"
+  local slug="$2"
+  local host="$3"
+  if [[ -z "$host" ]]; then
+    case "$provider" in
+      gh|github)
+        host="${HERMES_GCL_GITHUB_HOST:-github.com}"
+        ;;
+      gl|gitlab)
+        host="${HERMES_GCL_GITLAB_HOST:-gitlab.com}"
+        ;;
+      bb|bitbucket)
+        host="${HERMES_GCL_BITBUCKET_HOST:-bitbucket.org}"
+        ;;
+      *)
+        host="$provider"
+        ;;
+    esac
+  fi
+
+  if [[ "$proto" == "ssh" ]]; then
+    printf 'git@%s:%s.git' "$host" "$slug"
+  else
+    printf 'https://%s/%s.git' "$host" "$slug"
+  fi
+}
+
+if [[ "$spec" == *"://"* || "$spec" == git@* ]]; then
+  remote="$spec"
+else
+  provider="$default_provider"
+  slug="$spec"
+
+  if [[ "$spec" == *":"* ]]; then
+    prefix="${spec%%:*}"
+    remainder="${spec#*:}"
+    if [[ "$remainder" == */* ]]; then
+      provider="$prefix"
+      slug="$remainder"
+    fi
+  fi
+
+  if [[ "$slug" != */* ]]; then
+    echo "Repository spec must look like namespace/repo" >&2
+    exit 1
+  fi
+
+  remote="$(build_remote "$provider" "$slug" "$explicit_host")"
+fi
+
+cmd=(git clone "$remote")
+if [[ -n "$destination" ]]; then
+  cmd+=("$destination")
+fi
+if [[ ${#clone_args[@]} -gt 0 ]]; then
+  cmd+=("${clone_args[@]}")
+fi
+if [[ ${#extra_env_args[@]} -gt 0 ]]; then
+  cmd+=("${extra_env_args[@]}")
+fi
+
+printf 'Cloning %s\n' "$remote"
+exec "${cmd[@]}"

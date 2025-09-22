@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Manage git configuration scoped to directory prefixes."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Iterable, List, Sequence, Tuple
+
+KEY_SHORTCUTS = {
+    "username": "user.name",
+    "name": "user.name",
+    "useremail": "user.email",
+    "email": "user.email",
+    "signingkey": "user.signingkey",
+}
+
+
+class ScopeError(Exception):
+    """Raised when scope configuration cannot be computed."""
+
+
+def git_config(
+    args: Sequence[str],
+    *,
+    capture_output: bool = False,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``git config`` with the provided arguments."""
+
+    return subprocess.run(
+        ["git", "config", *args],
+        check=check,
+        capture_output=capture_output,
+        text=True,
+    )
+
+
+def hermes_config_home() -> Path:
+    """Return Hermes' configuration root."""
+
+    override = os.environ.get("HERMES_GIT_SCOPE_HOME")
+    if override:
+        return Path(override).expanduser()
+
+    base = Path(
+        os.environ.get(
+            "HERMES_CONFIG_HOME",
+            Path.home() / ".config" / "hermes",
+        )
+    )
+    return base / "git-scopes"
+
+
+def canonicalize_key(raw_key: str) -> str:
+    """Normalize shorthand keys into ``section.key`` form."""
+
+    key = raw_key.strip()
+    if not key:
+        raise ScopeError("Empty key is not allowed")
+
+    collapsed = key.replace("-", "").replace("_", "").lower()
+    if collapsed in KEY_SHORTCUTS:
+        return KEY_SHORTCUTS[collapsed]
+
+    if "." in key:
+        return key
+
+    raise ScopeError(
+        f"Key '{raw_key}' is not understood. Use section.key or a known shortcut."
+    )
+
+
+def parse_assignments(raw: Iterable[str]) -> List[Tuple[str, str]]:
+    """Return ``(key, value)`` tuples for ``key=value`` assignments."""
+
+    assignments: List[Tuple[str, str]] = []
+    for item in raw:
+        if "=" not in item:
+            raise ScopeError(f"Assignment '{item}' must look like key=value")
+        key, value = item.split("=", 1)
+        assignments.append((canonicalize_key(key), value.strip()))
+    return assignments
+
+
+def parse_unsets(raw: Iterable[str]) -> List[str]:
+    """Normalize keys that should be removed."""
+
+    return [canonicalize_key(item) for item in raw]
+
+
+def compute_scope(path_str: str, scope_home: Path) -> Tuple[Path, str, Path, str]:
+    """Return the scope root, include pattern, config path and display path."""
+
+    target = Path(path_str).expanduser()
+    if not target.is_absolute():
+        target = (Path.cwd() / target).resolve()
+    else:
+        target = target.resolve()
+
+    display = target.as_posix()
+    pattern_root = display if display.endswith("/") else f"{display}/"
+    include_pattern = f"gitdir:{pattern_root}**"
+
+    safe_name = display.strip("/").replace("/", "_").replace(":", "-")
+    if not safe_name:
+        safe_name = "root"
+    digest = hashlib.sha1(display.encode("utf-8")).hexdigest()[:8]
+    config_path = scope_home / f"{safe_name}-{digest}.gitconfig"
+    return target, include_pattern, config_path, display
+
+
+def ensure_global_include(pattern: str, config_path: Path) -> None:
+    """Ensure the includeIf entry exists in the global git config."""
+
+    include_key = f'includeIf."{pattern}".path'
+    config_path_str = str(config_path.resolve())
+    existing = git_config(
+        ["--global", "--get-all", include_key],
+        capture_output=True,
+        check=False,
+    )
+    if existing.returncode == 0:
+        values = {line.strip() for line in existing.stdout.splitlines()}
+        if config_path_str in values:
+            return
+    git_config(["--global", "--add", include_key, config_path_str])
+
+
+def remove_global_include(pattern: str, config_path: Path) -> None:
+    """Drop the includeIf entry if it points at the provided config file."""
+
+    include_key = f'includeIf."{pattern}".path'
+    git_config(
+        ["--global", "--unset", include_key, str(config_path.resolve())],
+        check=False,
+    )
+
+
+def collect_scope_values(config_path: Path) -> List[str]:
+    """Return ``section.key=value`` entries defined in the scoped config."""
+
+    if not config_path.exists():
+        return []
+    result = git_config(
+        ["--file", str(config_path), "--list"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def list_scopes(scope_home: Path) -> int:
+    """Print all gitdir-based scoped includes found in the global config."""
+
+    result = git_config(
+        ["--global", "--get-regexp", r"^includeIf\..*\.path$"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        print("No scoped git configs registered yet.")
+        return 0
+
+    include_re = re.compile(r'^includeIf\."gitdir:(.+)"\.path$')
+    rows: List[Tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        key, value = parts
+        match = include_re.match(key)
+        if not match:
+            continue
+        scope = match.group(1)
+        display = scope
+        if display.startswith("gitdir:"):
+            display = display[len("gitdir:") :]
+        if display.endswith("**"):
+            display = display[:-2]
+        rows.append((display, value.strip()))
+
+    if not rows:
+        print("No gitdir scoped configs found in the global config.")
+        return 0
+
+    width = max(len(scope) for scope, _ in rows)
+    scope_home_resolved = scope_home.resolve()
+    for scope, value in sorted(rows):
+        marker = ""
+        try:
+            value_path = Path(value).expanduser().resolve()
+            value_path.relative_to(scope_home_resolved)
+            marker = " *"
+        except Exception:
+            marker = ""
+        print(f"{scope.ljust(width)} -> {value}{marker}")
+    if rows:
+        print("('*' marks configs managed under Hermes' scope directory)")
+    return 0
+
+
+def apply_scope(
+    display: str,
+    pattern: str,
+    config_path: Path,
+    assignments: Sequence[Tuple[str, str]],
+    unsets: Sequence[str],
+) -> None:
+    """Apply key updates/removals to the scoped git config."""
+
+    if not assignments and not unsets:
+        return
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_config = config_path.resolve()
+
+    if assignments:
+        print(f"Setting scoped git config for {display}:")
+    for key, value in assignments:
+        git_config(["--file", str(resolved_config), key, value])
+        print(f"  {key} = {value}")
+
+    removed: List[str] = []
+    for key in unsets:
+        result = git_config(
+            ["--file", str(resolved_config), "--unset-all", key],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            removed.append(key)
+        else:
+            print(f"  (no existing value for {key})")
+    if removed:
+        print("Removed keys:")
+        for key in removed:
+            print(f"  {key}")
+
+    values = collect_scope_values(resolved_config)
+    if values:
+        ensure_global_include(pattern, resolved_config)
+        print(f"Config stored at {resolved_config} now contains:")
+        for line in values:
+            print(f"  {line}")
+        print(
+            "This scope applies to repositories whose .git directory lives under",
+            f"{display}/",
+        )
+    else:
+        if resolved_config.exists():
+            resolved_config.unlink()
+        remove_global_include(pattern, resolved_config)
+        print("No values remain for this scope. Removed the scoped config file.")
+
+
+def show_scope(display: str, config_path: Path) -> None:
+    """Print current values for the computed scope."""
+
+    print(f"Scope root : {display}")
+    print(f"Config file: {config_path}")
+    values = collect_scope_values(config_path)
+    if not values:
+        print("No scoped configuration defined yet.")
+        return
+    print("Entries:")
+    for line in values:
+        print(f"  {line}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    description = """\
+Configure git settings that apply to every repository inside a directory tree.
+
+Examples:
+  git scope username=myuser useremail=my@work.com
+  git scope --path ~/work/gitlab/mycompany user.signingkey=ABCDEF
+  git scope --unset user.signingkey
+  git scope --list
+"""
+
+    parser = argparse.ArgumentParser(
+        prog="git scope",
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "assignments",
+        nargs="*",
+        help="key=value pairs to add or update in the scoped config",
+    )
+    parser.add_argument(
+        "--path",
+        "-p",
+        default=".",
+        help="Directory whose repositories should receive the scoped config",
+    )
+    parser.add_argument(
+        "--unset",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Remove a key from the scoped config (can be repeated)",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List all scoped git includes detected in the global config",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Show the entries defined for the computed scope",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    scope_home = hermes_config_home()
+
+    if args.list:
+        if args.assignments or args.unset or args.show:
+            parser.error("--list cannot be combined with other operations")
+        return list_scopes(scope_home)
+
+    if not args.assignments and not args.unset and not args.show:
+        parser.error(
+            "Provide key=value assignments, --unset entries, or use --show/--list"
+        )
+
+    try:
+        _, pattern, config_path, display = compute_scope(args.path, scope_home)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ScopeError(str(exc)) from exc
+
+    try:
+        assignments = parse_assignments(args.assignments)
+        unsets = parse_unsets(args.unset)
+        apply_scope(display, pattern, config_path, assignments, unsets)
+        if args.show:
+            show_scope(display, config_path)
+    except ScopeError as exc:
+        parser.error(str(exc))
+    except subprocess.CalledProcessError as exc:
+        print(exc.stderr or exc, file=sys.stderr)
+        return exc.returncode
+
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry point
+    sys.exit(main())

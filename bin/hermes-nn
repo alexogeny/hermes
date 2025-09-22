@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Resolve navigation tokens into absolute directories.
+
+Hermes navigation supports expressive shortcuts described via a JSON structure.
+Each node looks like this::
+
+    {
+      "aliases": ["w", "work"],
+      "segment": "~/work",
+      "children": [ ... ]
+    }
+
+Child nodes append their ``segment`` to their parent path unless the segment is
+absolute. Tokens typed on the command line are matched against aliases using
+prefix matching (with exact matches taking precedence).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable, List, Sequence
+
+
+
+def discover_config_locations() -> List[Path]:
+    """Return potential config file locations in priority order."""
+    locations: List[Path] = []
+    override = os.environ.get("HERMES_NAVMAP")
+    if override:
+        locations.append(Path(override).expanduser())
+
+    config_home = Path(
+        os.environ.get("HERMES_CONFIG_HOME", Path.home() / ".config" / "hermes")
+    )
+    locations.append(config_home / "navmap.json")
+
+    script_root = Path(__file__).resolve().parent.parent
+    locations.append(script_root / "config" / "navmap.sample.json")
+    return locations
+
+
+@dataclass
+class NavNode:
+    aliases: Sequence[str]
+    segment: str
+    children: Sequence["NavNode"] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: object) -> "NavNode":
+        if not isinstance(data, dict):
+            raise ValueError("Node entries must be objects")
+
+        aliases = data.get("aliases")
+        if not aliases:
+            raise ValueError("Every node requires an 'aliases' list")
+        if not isinstance(aliases, list) or not all(
+            isinstance(alias, str) for alias in aliases
+        ):
+            raise ValueError("'aliases' must be a list of strings")
+
+        segment = data.get("segment")
+        if not isinstance(segment, str):
+            raise ValueError("Each node must define a string 'segment'")
+
+        raw_children = data.get("children", [])
+        if not isinstance(raw_children, list):
+            raise ValueError("'children' must be a list if present")
+        children = [cls.from_dict(item) for item in raw_children]
+        return cls(aliases=aliases, segment=segment, children=children)
+
+    def match(self, token: str) -> bool:
+        return any(alias == token for alias in self.aliases)
+
+    def fuzzy_match(self, token: str) -> bool:
+        return any(alias.startswith(token) for alias in self.aliases)
+
+
+class NavigationError(Exception):
+    pass
+
+
+def load_nodes() -> Sequence[NavNode]:
+    for path in discover_config_locations():
+        if path.is_file():
+            with path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, list):
+                return [NavNode.from_dict(item) for item in data]
+            raise NavigationError(
+                f"Expected a list of nodes in {path}, found {type(data).__name__}"
+            )
+    raise NavigationError(
+        "Unable to locate navmap.json. Set HERMES_NAVMAP or run install.sh"
+    )
+
+
+def join_segment(current: Path | None, segment: str) -> Path:
+    expanded = Path(os.path.expanduser(segment))
+    if expanded.is_absolute():
+        return expanded
+    if current is None:
+        return expanded
+    return (current / expanded).resolve()
+
+
+def pick_node(token: str, nodes: Sequence[NavNode]) -> NavNode:
+    exact = [node for node in nodes if node.match(token)]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        aliases = ", ".join(sorted({alias for node in exact for alias in node.aliases}))
+        raise NavigationError(f"Ambiguous token '{token}' (matches: {aliases})")
+
+    fuzzy = [node for node in nodes if node.fuzzy_match(token)]
+    if len(fuzzy) == 1:
+        return fuzzy[0]
+    if not fuzzy:
+        available = ", ".join(sorted(alias for node in nodes for alias in node.aliases))
+        raise NavigationError(f"Unknown token '{token}'. Known aliases: {available}")
+
+    options = ["/".join(node.aliases) for node in fuzzy]
+    raise NavigationError(
+        f"Ambiguous token '{token}'. Candidates: {', '.join(sorted(options))}"
+    )
+
+
+def resolve(tokens: Sequence[str], nodes: Sequence[NavNode]) -> Path:
+    current: Path | None = None
+    active_nodes: Sequence[NavNode] = nodes
+    for token in tokens:
+        node = pick_node(token, active_nodes)
+        current = join_segment(current, node.segment)
+        active_nodes = node.children
+    if current is None:
+        raise NavigationError("No tokens provided")
+    return current
+
+
+def iter_paths(
+    nodes: Sequence[NavNode], prefix: Sequence[str] | None = None, base: Path | None = None
+) -> Iterable[tuple[str, Path]]:
+    tokens = list(prefix or [])
+    for node in nodes:
+        primary = node.aliases[0]
+        alt_aliases = ", ".join(node.aliases[1:]) if len(node.aliases) > 1 else ""
+        new_tokens = tokens + [primary]
+        display = "/".join(new_tokens)
+        if alt_aliases:
+            display = f"{display} ({alt_aliases})"
+        target = join_segment(base, node.segment)
+        yield (display, target)
+        yield from iter_paths(node.children, new_tokens, target)
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Navigate using expressive Hermes shortcuts",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  hermes-nn w/gl/project\n"
+            "  hermes-nn --list\n"
+            "  hermes-nn work gitlab repo\n"
+        ),
+    )
+    parser.add_argument("tokens", nargs="*", help="Path tokens or slash-delimited input")
+    parser.add_argument("--list", action="store_true", help="List known paths")
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str]) -> int:
+    args = parse_args(argv)
+    try:
+        nodes = load_nodes()
+    except NavigationError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if args.list:
+        for label, path in iter_paths(nodes):
+            print(f"{label:<40} -> {path}")
+        return 0
+
+    if not args.tokens:
+        print("Provide tokens or use --list", file=sys.stderr)
+        return 1
+
+    if len(args.tokens) == 1 and "/" in args.tokens[0]:
+        tokens = [token for token in args.tokens[0].split("/") if token]
+    else:
+        tokens = list(args.tokens)
+
+    if not tokens:
+        print("No tokens supplied", file=sys.stderr)
+        return 1
+
+    try:
+        target = resolve(tokens, nodes)
+    except NavigationError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    print(str(target))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,47 @@
+[alias]
+    s = status -sb
+    st = status
+    co = checkout
+    cob = checkout -b
+    sw = switch
+    swc = switch -c
+    b = branch -a
+    br = branch -vv
+    df = diff
+    dc = diff --cached
+    ds = diff --stat
+    lg = log --oneline --decorate --graph
+    ll = log --stat
+    lga = log --oneline --decorate --graph --all
+    amend = commit --amend --no-edit
+    undo = reset --soft HEAD~1
+    recent = for-each-ref --count=15 --sort=-committerdate refs/heads/ --format='%(color:green)%(committerdate:relative)%09%(color:reset)%(refname:short)'
+    root = rev-parse --show-toplevel
+    cleanup-merged = !git branch --merged | grep -v '\*' | xargs -r git branch -d
+    fresh-switch = !git-fresh-switch
+    ours = checkout --ours --
+    theirs = checkout --theirs --
+
+[fetch]
+    prune = true
+
+[pull]
+    ff = only
+
+[push]
+    default = current
+
+[merge]
+    ff = only
+
+[rebase]
+    autoSquash = true
+
+[rerere]
+    enabled = true
+
+[core]
+    quotepath = false
+
+[color]
+    ui = auto
