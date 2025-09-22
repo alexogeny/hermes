@@ -1,0 +1,2 @@
+# hermes
+super powered cli
