@@ -78,6 +78,11 @@ location as long as the prefix is unambiguous.
   Pass `--include-ignored` to nuke ignored files as well and `--push` to publish
   immediately.
 - `gfs` – shell alias for `git fresh-switch`.
+- `git scope key=value ...` – create directory-specific git config includes so
+  every repo within a folder inherits the right identity. Try
+  `gitconfig username=acme-dev useremail=dev@acme.com` from
+  `~/work/gitlab/acme` to pin your name/email for that tree. Use `--list` to see
+  all scoped configs and `--unset key` to remove entries.
 - `gcl <namespace/repo>` – clone from GitHub/GitLab/Bitbucket using the terse
   providers (`gh:`, `gl:`, `bb:`) or custom hosts via `-H`. Use
   `gcl --protocol https ...` if you prefer HTTPS.

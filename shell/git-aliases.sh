@@ -48,3 +48,7 @@ gclean() {
 
 # Shortcut to Hermes' fresh switch command.
 alias gfs='git fresh-switch'
+
+# Directory-scoped git configuration helper.
+alias gitconfig='git scope'
+alias gscope='git scope'
