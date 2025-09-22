@@ -1,0 +1,38 @@
+[
+  {
+    "aliases": ["w", "work"],
+    "segment": "~/work",
+    "children": [
+      {
+        "aliases": ["gh", "github"],
+        "segment": "github",
+        "children": [
+          {
+            "aliases": ["oss", "open-source"],
+            "segment": "oss"
+          }
+        ]
+      },
+      {
+        "aliases": ["gl", "gitlab"],
+        "segment": "gitlab",
+        "children": [
+          {
+            "aliases": ["ev", "evernet"],
+            "segment": "evernet",
+            "children": [
+              {
+                "aliases": ["bf", "betterfly"],
+                "segment": "betterfly"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "aliases": ["cfg", "config"],
+    "segment": "~/.config"
+  }
+]

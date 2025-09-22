@@ -1,0 +1,6 @@
+--smart-case
+--colors=path:fg:blue
+--colors=line:fg:green
+--colors=match:fg:red
+--hidden
+--glob=!.git

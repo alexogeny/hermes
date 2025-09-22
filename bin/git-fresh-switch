@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: git fresh-switch [options] <branch> [remote] [base]
+
+Reset all local work and switch to <branch>, recreating it from the remote.
+If <branch> exists on the remote it will be checked out exactly as-is. When the
+branch does not exist remotely, it will be created off <base> (defaults to the
+remote's HEAD). Optionally push the new branch upstream.
+
+Options:
+  -p, --push            Push the branch to the remote after switching
+      --include-ignored Remove ignored files as well when cleaning
+  -h, --help            Show this help message
+USAGE
+}
+
+push_after=0
+clean_flags="-fd"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--push)
+      push_after=1
+      shift
+      ;;
+    --include-ignored)
+      clean_flags="-fdx"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage >&2
+  exit 1
+fi
+
+branch="$1"
+remote="${2:-origin}"
+base="${3:-}"
+
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "git fresh-switch must be run inside a repository" >&2
+  exit 1
+fi
+
+echo "Fetching from $remote..."
+git fetch "$remote" --prune
+
+if git show-ref --quiet --verify "refs/remotes/$remote/$branch"; then
+  start_point="$remote/$branch"
+  new_branch=0
+else
+  new_branch=1
+  if [[ -z "$base" ]]; then
+    head_ref="$(git symbolic-ref --quiet "refs/remotes/$remote/HEAD" 2>/dev/null || true)"
+    if [[ -n "$head_ref" ]]; then
+      base="${head_ref#refs/remotes/$remote/}"
+    fi
+  fi
+  if [[ -z "$base" ]]; then
+    for candidate in main master trunk develop; do
+      if git show-ref --quiet --verify "refs/remotes/$remote/$candidate"; then
+        base="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$base" ]]; then
+    echo "Unable to determine a base branch. Provide one explicitly." >&2
+    exit 1
+  fi
+  start_point="$remote/$base"
+fi
+
+echo "Resetting working tree (clean flags: $clean_flags)..."
+git reset --hard HEAD
+# shellcheck disable=SC2086
+git clean $clean_flags
+
+echo "Checking out $branch from $start_point..."
+git checkout -f -B "$branch" "$start_point"
+git reset --hard "$start_point"
+# shellcheck disable=SC2086
+git clean $clean_flags
+
+echo "Now on branch $branch"
+if [[ $new_branch -eq 1 ]]; then
+  echo "Created new branch from $start_point"
+  if [[ $push_after -eq 1 ]]; then
+    git push --set-upstream "$remote" "$branch"
+  fi
+elif [[ $push_after -eq 1 ]]; then
+  git push "$remote" "$branch"
+fi
+
+exit 0
